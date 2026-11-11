@@ -54,6 +54,7 @@ No database or credentials are required for the unit tests.
 source .venv/Scripts/activate    # otherwise use .venv/Scripts/python explicitly
 set -a; . ./.env; set +a         # optional; without DATABASE_URL it runs in memory
 python -m ethos                  # http://127.0.0.1:8000/docs
+python -m ethos --reload         # development: restart on changes under ethos/
 ```
 
 The dependencies live in `.venv`, not in the system Python: running the server
