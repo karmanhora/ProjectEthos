@@ -9,7 +9,8 @@ state, so a counterfactual can never mutate the environment it was derived from.
 
 ## Status
 
-Stage 1 — domain foundation. No API, no database access yet.
+Stage 2 — the world can be driven end to end in memory. No API and no database
+connection yet; the migrations are authored and awaiting review.
 
 | Module | Purpose |
 |---|---|
@@ -18,6 +19,10 @@ Stage 1 — domain foundation. No API, no database access yet.
 | `ethos/config.py` | Process settings from the environment; secrets never logged |
 | `ethos/models.py` | Ten entity models, `Environment`, `EnvironmentState`, `ChangeSet`, event and snapshot |
 | `ethos/state.py` | State hashing, diffing, delta application, replay, chain verification |
+| `ethos/permissions.py` | Roles to capabilities, resolved org-first then project |
+| `ethos/actions.py` | Registry of twelve pure handlers; the only path that changes state |
+| `ethos/repository.py` | Snapshot-plus-replay protocol and the in-memory implementation |
+| `ethos/service.py` | Validate, authorize, apply, diff, record and append, in one commit |
 
 ## Immutability
 
@@ -49,7 +54,10 @@ Three independent checks, each answering a different question:
 
 A stored head on `environments` (`last_event_sequence`, `last_event_digest`)
 detects deletion of trailing events, which state reconciliation alone cannot: a
-deleted trailing *failure* leaves state unchanged.
+deleted trailing *failure* leaves state unchanged. The head is stored beside the
+log and is deliberately **not** part of the hashed state: every event records the
+hash of the state it produced, so a head inside that state would make each event
+digest depend on itself and no commit could ever be computed.
 
 This is tamper-evidence against partial modification, not tamper-proofness. An
 administrator who rewrites the history and recomputes the head is undetectable
