@@ -9,9 +9,9 @@ state, so a counterfactual can never mutate the environment it was derived from.
 
 ## Status
 
-Stage 2 — the world can be driven end to end in memory. No API yet, and the
-application does not open a database connection: both migrations are applied to
-the hosted Supabase project and verified from the catalog.
+Stage 3 — runnable. The domain core, both repositories and an HTTP API are in
+place, and `python -m ethos` serves it. Simulation and prediction are not built
+yet.
 
 | Module | Purpose |
 |---|---|
@@ -25,6 +25,8 @@ the hosted Supabase project and verified from the catalog.
 | `ethos/repository.py` | Snapshot-plus-replay protocol and the in-memory implementation |
 | `ethos/service.py` | Validate, authorize, apply, diff, record and append, in one commit |
 | `ethos/postgres_repository.py` | Postgres implementation: one transaction per commit, snapshot plus replay on load |
+| `ethos/composition.py` | Composition root: picks the repository and builds services |
+| `ethos/api/` | FastAPI routes, wire models and the error envelope |
 
 ## Immutability
 
@@ -45,6 +47,19 @@ pytest tests/unit -v
 ```
 
 No database or credentials are required for the unit tests.
+
+## Running
+
+```bash
+set -a; . ./.env; set +a   # optional; without DATABASE_URL it runs in memory
+python -m ethos            # http://127.0.0.1:8000/docs
+```
+
+`POST /v1/environments` bootstraps an environment, `POST
+/v1/environments/{id}/actions` executes one action, and reads are available for
+the environment summary, the event log and an integrity check. `/health` names
+the repository in use, so an unintended in-memory fallback is visible rather
+than silent.
 
 ## Integrity model
 
