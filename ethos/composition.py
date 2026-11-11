@@ -24,8 +24,18 @@ def build_repository(settings: Settings) -> EnvironmentRepository:
     healthy while quietly discarding state on exit.
     """
     if settings.database_url:
-        from ethos.postgres_repository import PostgresRepository
-
+        try:
+            from ethos.postgres_repository import PostgresRepository
+        except ModuleNotFoundError as exc:
+            # Most often this is the wrong interpreter: DATABASE_URL is set, but
+            # the process is the system Python rather than the project venv.
+            raise RuntimeError(
+                "DATABASE_URL is set but the Postgres driver is missing "
+                f"({exc.name}). The dependencies are probably not installed in "
+                "the interpreter running this command. Use the project venv:\n"
+                "  .venv/Scripts/python -m pip install -r requirements.txt\n"
+                "  .venv/Scripts/python -m ethos"
+            ) from exc
         return PostgresRepository(settings.database_url)
     return InMemoryRepository()
 
