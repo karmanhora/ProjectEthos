@@ -504,11 +504,22 @@ begin
 end
 $$;
 
--- 4. ethos_app kept exactly what it was given, and nothing more. Without this,
---    an over-broad REVOKE above would only be discovered by a failing write.
+-- 4. ethos_app's table-level privileges are exactly SELECT and INSERT on every
+--    one of the 12 Ethos tables, and nothing else. UPDATE exists only per
+--    column, so a table-level UPDATE here would bypass the column lists
+--    entirely; DELETE, TRUNCATE, REFERENCES and TRIGGER are never granted, nor
+--    is MAINTAIN on PostgreSQL 17+. Checked table by table, so a gap on one
+--    cannot hide behind a correct neighbour.
+--
+--    has_table_privilege reads the table ACL and does not treat a column-level
+--    grant as a table-level one, which is why the legitimate column UPDATE
+--    grants do not trip the withheld UPDATE probe. Those are validated
+--    separately, in both directions, by validation 6.
 do $$
 declare
     table_name text;
+    privilege  text;
+    withheld   text[];
     ethos_tables text[] := array[
         'environments', 'organizations', 'environment_users', 'teams',
         'team_memberships', 'projects', 'project_memberships', 'tasks',
@@ -516,6 +527,15 @@ declare
         'environment_snapshots'
     ];
 begin
+    -- MAINTAIN exists only from PostgreSQL 17 and is rejected as an unknown
+    -- privilege name by older servers, so it joins the list only where it
+    -- exists. Built as data rather than as five repeated IF blocks so that one
+    -- list governs every table.
+    withheld := array['UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER'];
+    if current_setting('server_version_num')::int >= 170000 then
+        withheld := withheld || 'MAINTAIN';
+    end if;
+
     foreach table_name in array ethos_tables loop
         if not has_table_privilege('ethos_app', format('public.%I', table_name), 'SELECT') then
             raise exception 'ethos_app lost SELECT on public.%', table_name;
@@ -523,35 +543,19 @@ begin
         if not has_table_privilege('ethos_app', format('public.%I', table_name), 'INSERT') then
             raise exception 'ethos_app lost INSERT on public.%', table_name;
         end if;
+
+        foreach privilege in array withheld loop
+            if has_table_privilege(
+                'ethos_app',
+                format('public.%I', table_name),
+                privilege
+            ) then
+                raise exception
+                    'ethos_app must not hold % on public.%',
+                    privilege, table_name;
+            end if;
+        end loop;
     end loop;
-
-    if has_table_privilege('ethos_app', 'public.environment_events', 'UPDATE') then
-        raise exception 'ethos_app must not UPDATE environment_events';
-    end if;
-    if has_table_privilege('ethos_app', 'public.environment_events', 'DELETE') then
-        raise exception 'ethos_app must not DELETE environment_events';
-    end if;
-    if has_table_privilege('ethos_app', 'public.environment_snapshots', 'UPDATE') then
-        raise exception 'ethos_app must not UPDATE environment_snapshots';
-    end if;
-    if has_table_privilege('ethos_app', 'public.environment_snapshots', 'DELETE') then
-        raise exception 'ethos_app must not DELETE environment_snapshots';
-    end if;
-    if has_table_privilege('ethos_app', 'public.environments', 'DELETE') then
-        raise exception 'ethos_app must not DELETE environments';
-    end if;
-
-    -- Nothing above grants MAINTAIN, and this keeps it that way. Nested rather
-    -- than combined with AND: PL/pgSQL does not guarantee short-circuit
-    -- evaluation, and on a pre-17 server the bare name would raise.
-    if current_setting('server_version_num')::int >= 170000 then
-        if has_table_privilege('ethos_app', 'public.environment_events', 'MAINTAIN') then
-            raise exception 'ethos_app must not have MAINTAIN on environment_events';
-        end if;
-        if has_table_privilege('ethos_app', 'public.environments', 'MAINTAIN') then
-            raise exception 'ethos_app must not have MAINTAIN on environments';
-        end if;
-    end if;
 end
 $$;
 

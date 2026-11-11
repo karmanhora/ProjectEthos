@@ -187,6 +187,23 @@ def test_ethos_app_positive_control_is_asserted():
     assert "ethos_app lost insert" in LOWER
 
 
+def test_ethos_app_withheld_table_privileges_are_enumerated():
+    # UPDATE is withheld at table level because it exists only per column.
+    assert (
+        "withheld := array['update', 'delete', 'truncate', 'references', 'trigger']"
+        in LOWER
+    )
+    assert "foreach privilege in array withheld" in LOWER
+    assert "ethos_app must not hold % on public.%" in LOWER
+
+
+def test_ethos_app_withheld_check_runs_per_table():
+    # Same twelve-table array as the positive checks: every table is probed,
+    # not a sample of them.
+    assert "foreach table_name in array ethos_tables loop" in SQL
+    assert "format('public.%I', table_name),\n                privilege" in SQL
+
+
 def test_ethos_app_memberships_are_checked():
     # NOINHERIT blocks automatic inheritance, but SET ROLE still reaches a
     # granted role, so membership alone is an escalation path.
@@ -215,6 +232,8 @@ def test_maintain_is_version_gated():
     assert "privileges := privileges || ',MAINTAIN'" in SQL
 
 
-def test_maintain_check_covers_or_omits_nothing():
+def test_maintain_is_withheld_on_pg17():
+    # MAINTAIN joins the withheld list only where the name exists, so the same
+    # loop covers it on 17+ without breaking older servers.
+    assert "withheld := withheld || 'MAINTAIN'" in SQL
     assert "'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER'" in SQL
-    assert "ethos_app must not have maintain" in LOWER
