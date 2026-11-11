@@ -11,13 +11,17 @@ from fastapi import FastAPI
 from ethos.api.errors import install_error_handlers
 from ethos.api.routes import router
 from ethos.composition import build_repository
-from ethos.config import Settings
+from ethos.config import Settings, load_environment
 from ethos.runtime import SystemClock, UuidFactory
 
 __all__ = ["create_app"]
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
+    # Only when settings are read from the environment: an explicit Settings
+    # object is a caller's decision and must not be second-guessed by a file.
+    if settings is None:
+        load_environment()
     resolved = settings or Settings.from_env()
 
     app = FastAPI(

@@ -3,9 +3,39 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Mapping
 
-__all__ = ["Settings"]
+from dotenv import load_dotenv
+
+__all__ = ["Settings", "load_environment"]
+
+
+def load_environment(path: str | Path | None = None) -> Path | None:
+    """Load `.env` into the process environment.
+
+    Real environment variables win: `override=False` means an explicitly
+    exported value is never silently replaced by the file.
+
+    This is called at startup only, never from `Settings.from_env()`. Tests and
+    library callers must not pick up a developer's `.env` by accident - the
+    integration suite, for one, is guarded by variables it expects to be set
+    deliberately.
+
+    Returns the file that was loaded, or `None` when there was nothing to read.
+    """
+    if path is not None:
+        candidates = [Path(path)]
+    else:
+        candidates = [
+            Path.cwd() / ".env",
+            Path(__file__).resolve().parent.parent / ".env",
+        ]
+    for candidate in candidates:
+        if candidate.is_file():
+            load_dotenv(candidate, override=False)
+            return candidate
+    return None
 
 
 def _flag(source: Mapping[str, str], name: str, default: bool = False) -> bool:

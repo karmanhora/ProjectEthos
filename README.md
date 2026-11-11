@@ -52,7 +52,6 @@ No database or credentials are required for the unit tests.
 
 ```bash
 source .venv/Scripts/activate    # otherwise use .venv/Scripts/python explicitly
-set -a; . ./.env; set +a         # optional; without DATABASE_URL it runs in memory
 python -m ethos                  # http://127.0.0.1:8000/docs
 python -m ethos --reload         # development: restart on changes under ethos/
 ```
@@ -60,6 +59,10 @@ python -m ethos --reload         # development: restart on changes under ethos/
 The dependencies live in `.venv`, not in the system Python: running the server
 with an interpreter that lacks them fails with `ModuleNotFoundError`. The error
 now names the venv command to use instead.
+
+`.env` is read automatically at startup - from the working directory, or the
+project root when started elsewhere. An exported variable always wins over the
+file, so `DATABASE_URL=... python -m ethos` still overrides it.
 
 `POST /v1/environments` bootstraps an environment, `POST
 /v1/environments/{id}/actions` executes one action, and reads are available for

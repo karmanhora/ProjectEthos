@@ -12,7 +12,7 @@ from pathlib import Path
 import uvicorn
 
 from ethos.api.app import create_app
-from ethos.config import Settings
+from ethos.config import Settings, load_environment
 
 PACKAGE_DIR = Path(__file__).resolve().parent
 
@@ -28,6 +28,9 @@ def main(argv: list[str] | None = None) -> None:
     )
     args = parser.parse_args(argv)
 
+    # Load before reading settings, and before uvicorn forks for --reload, so the
+    # child process inherits the same values.
+    load_environment()
     settings = Settings.from_env()
 
     if args.reload:
