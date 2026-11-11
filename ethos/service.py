@@ -10,7 +10,7 @@ injected IdFactory, so a run is reproducible from its inputs alone.
 """
 from __future__ import annotations
 
-from typing import Any, NoReturn
+from typing import Any
 from uuid import UUID
 
 from pydantic import Field
