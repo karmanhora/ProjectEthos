@@ -37,6 +37,25 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     install_error_handlers(app)
     app.include_router(router)
 
+    @app.get("/", tags=["meta"])
+    def index() -> dict[str, object]:
+        # Without this, opening the server root returns FastAPI's bare 404, which
+        # reads like a broken deployment rather than "the API lives under /v1".
+        return {
+            "service": "project-ethos",
+            "version": "0.1.0",
+            "docs": "/docs",
+            "openapi": "/openapi.json",
+            "health": "/health",
+            "endpoints": {
+                "create_environment": "POST /v1/environments",
+                "read_environment": "GET /v1/environments/{environment_id}",
+                "run_action": "POST /v1/environments/{environment_id}/actions",
+                "list_events": "GET /v1/environments/{environment_id}/events",
+                "integrity": "GET /v1/environments/{environment_id}/integrity",
+            },
+        }
+
     @app.get("/health", tags=["meta"])
     def health() -> dict[str, str]:
         # Naming the repository makes a silent in-memory fallback visible.

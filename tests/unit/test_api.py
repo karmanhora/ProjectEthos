@@ -179,3 +179,11 @@ def test_idempotent_retry_returns_the_original_event(client):
     assert second["replayed"] is True
     assert second["event"]["id"] == first["event"]["id"]
     assert second["version"] == first["version"]
+
+
+def test_root_lists_the_api(client):
+    response = client.get("/")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["docs"] == "/docs"
+    assert body["endpoints"]["run_action"].endswith("/actions")
