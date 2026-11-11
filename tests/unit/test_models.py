@@ -35,8 +35,6 @@ def make_environment(version: int = 1) -> Environment:
         name="demo",
         config=EnvironmentRules(),
         version=version,
-        last_event_sequence=1,
-        last_event_digest="a" * 64,
         created_at=NOW,
         updated_at=NOW,
     )

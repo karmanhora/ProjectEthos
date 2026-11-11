@@ -202,15 +202,20 @@ class TaskDependency(FrozenModel):
 
 
 class Environment(FrozenModel):
-    """The environment row: config, state version, and the event-log head."""
+    """The environment's own content: identity, rules and content version.
+
+    The event-log head is deliberately *not* here. `state_hash` covers this
+    object, and every event records the hash of the state it produced, so a head
+    pointer stored here would make event N's digest depend on a state containing
+    event N's own digest - a cycle that cannot be computed. The head therefore
+    lives beside the log, on `repository.EnvironmentHead`.
+    """
 
     id: UUID
     name: str = Field(min_length=1, max_length=120)
     description: str | None = None
     config: EnvironmentRules = EnvironmentRules()
     version: int = Field(ge=1)
-    last_event_sequence: int = Field(ge=1)
-    last_event_digest: str = Field(min_length=64, max_length=64)
     status: Literal["active", "archived"] = "active"
     created_at: datetime
     updated_at: datetime

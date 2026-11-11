@@ -33,14 +33,12 @@ TASK_ID = UUID("33333333-3333-4333-8333-333333333333")
 TASK_ID_2 = UUID("66666666-6666-4666-8666-666666666666")
 
 
-def make_environment(version: int = 1, sequence: int = 1, digest: str = "a" * 64) -> Environment:
+def make_environment(version: int = 1) -> Environment:
     return Environment(
         id=ENV_ID,
         name="demo",
         config=EnvironmentRules(),
         version=version,
-        last_event_sequence=sequence,
-        last_event_digest=digest,
         created_at=NOW,
         updated_at=NOW,
     )
@@ -59,9 +57,9 @@ def make_task(task_id: UUID = TASK_ID, status: TaskStatus = TaskStatus.TODO) -> 
     )
 
 
-def make_state(*, version: int = 1, sequence: int = 1, digest: str = "a" * 64, **kwargs) -> EnvironmentState:
+def make_state(*, version: int = 1, **kwargs) -> EnvironmentState:
     return EnvironmentState(
-        environment=make_environment(version=version, sequence=sequence, digest=digest),
+        environment=make_environment(version=version),
         **kwargs,
     )
 
@@ -213,7 +211,7 @@ def test_apply_rejects_delete_of_missing_entity():
 
 
 def build_chain():
-    env1 = make_environment(version=1, sequence=1, digest="c" * 64)
+    env1 = make_environment(version=1)
     state1 = EnvironmentState(environment=env1)
     e1 = make_event(
         sequence=1,
@@ -226,7 +224,7 @@ def build_chain():
     )
 
     state2 = EnvironmentState(
-        environment=make_environment(version=2, sequence=2, digest="d" * 64),
+        environment=make_environment(version=2),
         tasks={TASK_ID: make_task()},
     )
     e2 = make_event(
