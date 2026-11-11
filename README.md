@@ -24,6 +24,7 @@ the hosted Supabase project and verified from the catalog.
 | `ethos/actions.py` | Registry of twelve pure handlers; the only path that changes state |
 | `ethos/repository.py` | Snapshot-plus-replay protocol and the in-memory implementation |
 | `ethos/service.py` | Validate, authorize, apply, diff, record and append, in one commit |
+| `ethos/postgres_repository.py` | Postgres implementation: one transaction per commit, snapshot plus replay on load |
 
 ## Immutability
 
