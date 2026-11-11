@@ -14,6 +14,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
+import psycopg
 import pytest
 
 from ethos.config import Settings
@@ -59,8 +60,6 @@ def service(environment_id):
 @pytest.fixture(autouse=True)
 def cleanup(environment_id):
     yield
-    import psycopg
-
     with psycopg.connect(DSN) as connection:
         for table in (
             "environment_snapshots",
@@ -78,8 +77,16 @@ def cleanup(environment_id):
             connection.execute(
                 f"delete from {table} where environment_id = %s", (environment_id,)
             )
-        connection.execute("delete from environments where id = %s", (environment_id,))
-        connection.commit()
+            connection.commit()
+        try:
+            connection.execute(
+                "delete from environments where id = %s", (environment_id,)
+            )
+            connection.commit()
+        except psycopg.errors.InsufficientPrivilege:
+            # ethos_app deliberately holds no DELETE on environments: taking an
+            # environment out of service is a status change, not a deletion.
+            connection.rollback()
 
 
 def act(service, action_type, actor, parameters, key):
@@ -146,6 +153,16 @@ def test_actions_and_chain_verification_against_postgres(service):
     assert report.valid, report.divergence
     assert report.events_checked == 4
 
+    # The entity tables are a projection of the same ChangeSets, so they must
+    # agree with the log - including the completion constraint.
+    with psycopg.connect(DSN) as connection:
+        rows = connection.execute(
+            "select status, completed_at is not null from tasks "
+            "where environment_id = %s",
+            (service.environment_id,),
+        ).fetchall()
+    assert rows == [("done", True)]
+
 
 def test_duplicate_idempotency_key_is_rejected_by_the_database(service):
     boot = service.bootstrap(
@@ -174,3 +191,18 @@ def test_duplicate_idempotency_key_is_rejected_by_the_database(service):
         )
     )
     assert replayed.replayed is True
+
+
+def test_app_role_cannot_delete_an_environment(service):
+    service.bootstrap(
+        name="demo",
+        org_name="Acme",
+        org_slug="acme",
+        owner_handle="ada",
+        owner_display_name="Ada Lovelace",
+    )
+    with pytest.raises(psycopg.errors.InsufficientPrivilege):
+        with psycopg.connect(DSN) as connection:
+            connection.execute(
+                "delete from environments where id = %s", (service.environment_id,)
+            )

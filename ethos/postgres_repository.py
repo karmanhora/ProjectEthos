@@ -27,7 +27,9 @@ from ethos.errors import (
     VersionConflict,
 )
 from ethos.models import (
+    ChangeOp,
     ChangeSet,
+    EntityType,
     EnvironmentEvent,
     EnvironmentSnapshot,
     EnvironmentState,
@@ -153,6 +155,66 @@ def _event_values(event: EnvironmentEvent) -> tuple[Any, ...]:
         event.prev_event_digest,
         event.event_digest,
         event.created_at,
+    )
+
+
+def _column_value(value: Any) -> Any:
+    """`to_plain` yields JSON-compatible data; jsonb columns need a wrapper."""
+    return Jsonb(value) if isinstance(value, (dict, list)) else value
+
+
+# State is kept in the entity tables as well as in the log, so the database is
+# queryable without replaying history. The mapping is explicit: a state
+# collection name is not always a table name (`users` is `environment_users`).
+_ENTITY_TABLES = {
+    EntityType.ORGANIZATION: "organizations",
+    EntityType.ENVIRONMENT_USER: "environment_users",
+    EntityType.TEAM: "teams",
+    EntityType.TEAM_MEMBERSHIP: "team_memberships",
+    EntityType.PROJECT: "projects",
+    EntityType.PROJECT_MEMBERSHIP: "project_memberships",
+    EntityType.TASK: "tasks",
+    EntityType.TASK_ASSIGNMENT: "task_assignments",
+    EntityType.TASK_DEPENDENCY: "task_dependencies",
+}
+
+
+def _apply_change(
+    connection: psycopg.Connection, change: Any, environment_id: Any
+) -> None:
+    """Fold one recorded entity change into its table.
+
+    Driven by the ChangeSet, never by the state snapshot, so the tables and the
+    log are written from the same evidence and cannot diverge.
+    """
+    table = _ENTITY_TABLES[change.entity_type]
+
+    if change.op is ChangeOp.DELETE:
+        connection.execute(
+            f"delete from {table} where id = %s and environment_id = %s",
+            (change.entity_id, environment_id),
+        )
+        return
+
+    if change.op is ChangeOp.CREATE:
+        payload = dict(change.after or {})
+        columns = list(payload)
+        connection.execute(
+            f"insert into {table} ({', '.join(columns)}) values "
+            f"({', '.join(['%s'] * len(columns))})",
+            [_column_value(payload[column]) for column in columns],
+        )
+        return
+
+    updates = {field.field: field.after for field in change.fields}
+    if not updates:
+        return
+    columns = list(updates)
+    connection.execute(
+        f"update {table} set {', '.join(f'{c} = %s' for c in columns)} "
+        "where id = %s and environment_id = %s",
+        [_column_value(updates[column]) for column in columns]
+        + [change.entity_id, environment_id],
     )
 
 
@@ -284,6 +346,14 @@ class PostgresRepository:
                                 "sequence": event.sequence,
                             },
                         )
+                # Entities are written before the event: the event references
+                # the actor, and on bootstrap the actor is created by it.
+                for change in event.changes.changes:
+                    if change.entity_type is EntityType.ENVIRONMENT:
+                        # Written above, including the head columns, which are
+                        # not part of the recorded change.
+                        continue
+                    _apply_change(connection, change, environment.id)
                 connection.execute(_INSERT_EVENT, _event_values(event))
         except psycopg.errors.UniqueViolation as exc:
             if (exc.diag.constraint_name or "") == IDEMPOTENCY_UNIQUE_CONSTRAINT:
