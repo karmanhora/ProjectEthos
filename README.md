@@ -9,8 +9,9 @@ state, so a counterfactual can never mutate the environment it was derived from.
 
 ## Status
 
-Stage 2 — the world can be driven end to end in memory. No API and no database
-connection yet; the migrations are authored and awaiting review.
+Stage 2 — the world can be driven end to end in memory. No API yet, and the
+application does not open a database connection: both migrations are applied to
+the hosted Supabase project and verified from the catalog.
 
 | Module | Purpose |
 |---|---|
