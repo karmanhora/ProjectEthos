@@ -62,13 +62,44 @@ $$;
 
 grant usage on schema public to ethos_app;
 
--- Start from nothing. A database that previously received table-wide
--- UPDATE/DELETE would otherwise keep them, and a partial revoke is the worst of
--- both worlds: it looks least-privilege without being it.
-revoke all privileges on all tables in schema public from ethos_app;
+-- Every grant and revoke below names one of the 12 Ethos tables. Nothing uses
+-- ALL TABLES IN SCHEMA public: this project has not been verified as dedicated
+-- exclusively to Ethos, so a schema-wide statement would silently alter grants
+-- on unrelated tables that happen to share the schema.
+do $$
+declare
+    table_name text;
+    ethos_tables text[] := array[
+        'environments',
+        'organizations',
+        'environment_users',
+        'teams',
+        'team_memberships',
+        'projects',
+        'project_memberships',
+        'tasks',
+        'task_assignments',
+        'task_dependencies',
+        'environment_events',
+        'environment_snapshots'
+    ];
+begin
+    foreach table_name in array ethos_tables loop
+        -- Start from nothing on these twelve tables only. A database that
+        -- previously received table-wide UPDATE/DELETE would otherwise keep
+        -- them, and a partial revoke is the worst of both worlds: it looks
+        -- least-privilege without being it.
+        execute format(
+            'revoke all privileges on table public.%I from ethos_app', table_name
+        );
 
--- Reads: needed everywhere, and harmless on the append-only tables.
-grant select on all tables in schema public to ethos_app;
+        -- Reads: needed everywhere, and harmless on the append-only tables.
+        execute format(
+            'grant select on table public.%I to ethos_app', table_name
+        );
+    end loop;
+end
+$$;
 
 -- Inserts: the commit pipeline creates rows in every table.
 grant insert on
@@ -118,9 +149,34 @@ grant update (removed_at) on task_assignments to ethos_app;
 revoke update, delete, truncate on environment_events from ethos_app;
 revoke update, delete, truncate on environment_snapshots from ethos_app;
 
--- No deletes anywhere for the runtime role. There is no delete action in the
--- domain, and taking an environment out of service is a status change.
-revoke delete, truncate on all tables in schema public from ethos_app;
+-- No deletes on any Ethos table for the runtime role. There is no delete
+-- action in the domain, and taking an environment out of service is a status
+-- change. Enumerated rather than schema-wide, so unrelated tables keep theirs.
+do $$
+declare
+    table_name text;
+    ethos_tables text[] := array[
+        'environments',
+        'organizations',
+        'environment_users',
+        'teams',
+        'team_memberships',
+        'projects',
+        'project_memberships',
+        'tasks',
+        'task_assignments',
+        'task_dependencies',
+        'environment_events',
+        'environment_snapshots'
+    ];
+begin
+    foreach table_name in array ethos_tables loop
+        execute format(
+            'revoke delete, truncate on table public.%I from ethos_app', table_name
+        );
+    end loop;
+end
+$$;
 
 -- ---------------------------------------------------------------------------
 -- anon and authenticated: no direct table privileges.
@@ -169,6 +225,66 @@ begin
         execute format(
             'revoke all privileges on table public.%I from public',
             table_name
+        );
+    end loop;
+end
+$$;
+
+-- ---------------------------------------------------------------------------
+-- anon, authenticated and PUBLIC: no column-level privileges either.
+-- ---------------------------------------------------------------------------
+-- Column privileges live in pg_attribute.attacl and are independent of the
+-- table ACL: revoking SELECT or UPDATE on the table does not remove a grant
+-- made on a single column, and has_table_privilege never looks at attacl. They
+-- have to be revoked explicitly, per column.
+do $$
+declare
+    table_name  text;
+    column_list text;
+    grantee     text;
+    ethos_tables text[] := array[
+        'environments',
+        'organizations',
+        'environment_users',
+        'teams',
+        'team_memberships',
+        'projects',
+        'project_memberships',
+        'tasks',
+        'task_assignments',
+        'task_dependencies',
+        'environment_events',
+        'environment_snapshots'
+    ];
+begin
+    foreach table_name in array ethos_tables loop
+        -- Only a column carrying an ACL entry can hold a grant, so the revoke
+        -- is limited to those and stays a no-op everywhere else.
+        select string_agg(format('%I', attribute.attname), ', ' order by attribute.attnum)
+          into column_list
+          from pg_attribute attribute
+         where attribute.attrelid = format('public.%I', table_name)::regclass
+           and attribute.attnum > 0
+           and not attribute.attisdropped
+           and attribute.attacl is not null;
+
+        if column_list is null then
+            continue;
+        end if;
+
+        foreach grantee in array array['anon', 'authenticated'] loop
+            if exists (select 1 from pg_roles where rolname = grantee) then
+                execute format(
+                    'revoke select (%s), insert (%s), update (%s) on table public.%I from %I',
+                    column_list, column_list, column_list, table_name, grantee
+                );
+            end if;
+        end loop;
+
+        -- PUBLIC is a pseudo-role and must stay unquoted.
+        execute format(
+            'revoke select (%s), insert (%s), update (%s) on table public.%I from public',
+            column_list, column_list, column_list, table_name
         );
     end loop;
 end
@@ -459,6 +575,122 @@ begin
             'ethos_app is a member of: %; a SET ROLE path to another role is not allowed, remove the membership manually',
             memberships;
     end if;
+end
+$$;
+
+-- 6. Column-level privileges, which the table ACL checks above cannot see.
+--    Both directions are asserted: nothing prohibited remains for
+--    anon/authenticated/PUBLIC, and ethos_app holds exactly the column-level
+--    UPDATE grants this migration intended - none missing, none extra.
+do $$
+declare
+    table_name  text;
+    column_name text;
+    offending   text;
+    permitted   text[];
+    position    int;
+    ethos_tables text[] := array[
+        'environments',
+        'organizations',
+        'environment_users',
+        'teams',
+        'team_memberships',
+        'projects',
+        'project_memberships',
+        'tasks',
+        'task_assignments',
+        'task_dependencies',
+        'environment_events',
+        'environment_snapshots'
+    ];
+    -- The exact column lists granted UPDATE above, in the same order.
+    granted_columns text[] := array[
+        'name,description,config,status,version,last_event_sequence,last_event_digest,updated_at',
+        'name,slug',
+        'display_name,org_role,is_active',
+        'name',
+        'role,removed_at,removed_by_id',
+        'name,description,status,lead_user_id,started_on,target_on,updated_at',
+        'role,removed_at',
+        'title,description,status,priority,task_type,due_on,completed_at,updated_at',
+        'removed_at',
+        '',
+        '',
+        ''
+    ];
+begin
+    for position in 1 .. array_length(ethos_tables, 1) loop
+        table_name := ethos_tables[position];
+
+        -- (a) No column-level privilege for the roles that must have none.
+        select string_agg(
+                   format('%s %s on %s',
+                          case
+                              when acl.grantee = 0 then 'PUBLIC'
+                              else pg_get_userbyid(acl.grantee)
+                          end,
+                          acl.privilege_type,
+                          attribute.attname),
+                   ', '
+               )
+          into offending
+          from pg_attribute attribute
+          cross join lateral aclexplode(attribute.attacl) acl
+         where attribute.attrelid = format('public.%I', table_name)::regclass
+           and attribute.attnum > 0
+           and not attribute.attisdropped
+           and (acl.grantee = 0
+                or pg_get_userbyid(acl.grantee) in ('anon', 'authenticated'))
+           and acl.privilege_type in ('SELECT', 'INSERT', 'UPDATE');
+
+        if offending is not null then
+            raise exception
+                'column-level privileges remain on public.%: %',
+                table_name, offending;
+        end if;
+
+        permitted := case
+                         when granted_columns[position] = '' then array[]::text[]
+                         else string_to_array(granted_columns[position], ',')
+                     end;
+
+        -- (b) ethos_app holds no column-level privilege except the intended
+        --     UPDATE grants. A column SELECT or INSERT would be as out of place
+        --     as an UPDATE on a column that was never granted.
+        select string_agg(
+                   format('%s (%s)', attribute.attname, acl.privilege_type),
+                   ', '
+               )
+          into offending
+          from pg_attribute attribute
+          cross join lateral aclexplode(attribute.attacl) acl
+         where attribute.attrelid = format('public.%I', table_name)::regclass
+           and attribute.attnum > 0
+           and not attribute.attisdropped
+           and acl.grantee = 'ethos_app'::regrole
+           and (acl.privilege_type <> 'UPDATE'
+                or not attribute.attname = any (permitted));
+
+        if offending is not null then
+            raise exception
+                'unexpected column-level privileges for ethos_app on public.%: %',
+                table_name, offending;
+        end if;
+
+        -- (c) Every intended column grant is still present.
+        foreach column_name in array permitted loop
+            if not has_column_privilege(
+                'ethos_app',
+                format('public.%I', table_name),
+                column_name,
+                'UPDATE'
+            ) then
+                raise exception
+                    'ethos_app lost column-level UPDATE on public.%.%',
+                    table_name, column_name;
+            end if;
+        end loop;
+    end loop;
 end
 $$;
 

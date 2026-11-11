@@ -1,8 +1,8 @@
 """Static checks over the grants migration.
 
 These cannot prove the SQL runs, but they do prove the guarantees are still
-written down: a later edit that deletes the anon revokes, reintroduces a
-table-wide UPDATE, or drops a validation, fails here without a database.
+written down: a later edit that reintroduces a schema-wide statement, drops a
+column-level revoke, or deletes a validation, fails here without a database.
 """
 from pathlib import Path
 
@@ -48,6 +48,20 @@ def test_every_table_is_named(table):
     assert f"'{table}'" in SQL
 
 
+# --- no schema-wide statements ----------------------------------------------
+
+
+def test_nothing_targets_the_whole_schema():
+    # Unrelated tables share public; nothing may be revoked or granted there.
+    assert "on all tables in schema public" not in LOWER
+
+
+def test_ethos_app_table_statements_are_enumerated():
+    assert "revoke all privileges on table public.%I from ethos_app" in SQL
+    assert "grant select on table public.%I to ethos_app" in SQL
+    assert "revoke delete, truncate on table public.%I from ethos_app" in SQL
+
+
 # --- anon / authenticated table access --------------------------------------
 
 
@@ -74,6 +88,39 @@ def test_roles_are_guarded_on_existence():
     # A bare Postgres has no anon/authenticated; naming them unguarded would
     # abort the migration instead of skipping the revoke.
     assert "from pg_roles where rolname = role_name" in LOWER
+
+
+# --- column-level privileges ------------------------------------------------
+
+
+def test_column_level_revokes_are_explicit():
+    assert "revoke select (%s), insert (%s), update (%s) on table public.%i" in LOWER
+    # PUBLIC is a pseudo-role and must not be quoted as a role name.
+    assert "on table public.%i from public" in LOWER
+    assert "attribute.attacl is not null" in SQL
+
+
+def test_column_level_privileges_are_inspected():
+    assert "pg_attribute" in LOWER
+    assert "aclexplode(attribute.attacl)" in LOWER
+    assert "column-level privileges remain" in LOWER
+
+
+def test_ethos_app_column_grants_are_distinguished():
+    # The prohibited set is anon/authenticated/PUBLIC, not every role: ethos_app
+    # holds legitimate column-level UPDATE grants.
+    assert "acl.grantee = 'ethos_app'::regrole" in SQL
+    assert "has_column_privilege" in LOWER
+    assert "unexpected column-level privileges for ethos_app" in LOWER
+    assert "lost column-level update" in LOWER
+
+
+def test_column_validation_matches_the_granted_columns():
+    assert (
+        "'name,description,config,status,version,last_event_sequence,last_event_digest,updated_at'"
+        in SQL
+    )
+    assert "'title,description,status,priority,task_type,due_on,completed_at,updated_at'" in SQL
 
 
 # --- default privileges -----------------------------------------------------
@@ -123,7 +170,6 @@ def test_global_default_failure_names_owning_role():
 
 
 def test_ethos_app_keeps_least_privilege_grants():
-    assert "grant select on all tables in schema public to ethos_app" in LOWER
     assert "grant update (" in LOWER
     # No table-wide UPDATE or DELETE grant anywhere.
     assert "grant update on" not in LOWER
