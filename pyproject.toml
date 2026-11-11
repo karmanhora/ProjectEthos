@@ -1,0 +1,26 @@
+[project]
+name = "ethos"
+version = "0.1.0"
+description = "Project Ethos - a controllable digital world for studying action consequences."
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.115,<0.116",
+  "uvicorn[standard]>=0.34,<0.35",
+  "pydantic>=2.10,<3",
+  "psycopg[binary]>=3.2,<3.3",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["ethos*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q"
+markers = [
+  "integration: requires a live database and is skipped when credentials are absent",
+]
