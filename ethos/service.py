@@ -81,16 +81,25 @@ class ExecutionResult(FrozenModel):
 
 
 def request_fingerprint(
-    action_type: str, actor_user_id: UUID, parameters: Any
+    action_type: str,
+    actor_user_id: UUID,
+    parameters: Any,
+    expected_version: int | None,
 ) -> str:
     """Identifies the *shape* of a request, so one idempotency key can never
-    silently serve a different action."""
+    silently serve a different action.
+
+    `expected_version` is part of it: a retry that asserts a different version is
+    a different request, and replaying the first result would tell the caller its
+    assertion held when it did not.
+    """
     return sha256_hex(
         canonical_json(
             {
                 "action_type": action_type,
                 "actor_user_id": actor_user_id,
                 "parameters": parameters,
+                "expected_version": expected_version,
             }
         )
     )
@@ -213,7 +222,7 @@ class EnvironmentService:
             resulting_state_hash=state_hash(state),
             idempotency_key="bootstrap",
             request_fingerprint=request_fingerprint(
-                "environment.bootstrap", owner.id, parameters
+                "environment.bootstrap", owner.id, parameters, None
             ),
             prev_event_digest=GENESIS_EVENT_DIGEST,
             created_at=now,
@@ -235,7 +244,10 @@ class EnvironmentService:
         parsed = parse_parameters(spec, request.parameters)
         normalized = to_plain(parsed)
         fingerprint = request_fingerprint(
-            request.action_type, request.actor_user_id, normalized
+            request.action_type,
+            request.actor_user_id,
+            normalized,
+            request.expected_version,
         )
 
         recorded = self._repository.find_event(
@@ -261,7 +273,7 @@ class EnvironmentService:
         now = self._clock.now()
 
         if actor is None or not actor.is_active:
-            self._record_failure(
+            return self._record_failure(
                 state,
                 head,
                 request,
@@ -284,7 +296,7 @@ class EnvironmentService:
         try:
             candidate = spec.handler(context)
         except RuleViolation as exc:
-            self._record_failure(
+            return self._record_failure(
                 state,
                 head,
                 request,
@@ -325,7 +337,13 @@ class EnvironmentService:
             last_event_sequence=event.sequence,
             last_event_digest=event.event_digest,
         )
-        self._repository.append(state=resulting, head=new_head, event=event)
+        stored = self._repository.append(
+            state=resulting, head=new_head, event=event
+        )
+        if stored.id != event.id:
+            # A concurrent request with the same key committed first. Its event
+            # is authoritative; replay it rather than report a conflict.
+            return self._replay(stored, fingerprint)
         self._save_snapshot(resulting, new_head, kind="auto")
         return ExecutionResult(event=event, state=resulting)
 
@@ -349,7 +367,7 @@ class EnvironmentService:
         code: FailureCode,
         reason: str,
         details: dict[str, Any],
-    ) -> NoReturn:
+    ) -> ExecutionResult:
         """Persist the refusal, then surface it to the caller."""
         event = self._build_event(
             sequence=head.last_event_sequence + 1,
@@ -377,7 +395,9 @@ class EnvironmentService:
             last_event_sequence=event.sequence,
             last_event_digest=event.event_digest,
         )
-        self._repository.append(state=state, head=new_head, event=event)
+        stored = self._repository.append(state=state, head=new_head, event=event)
+        if stored.id != event.id:
+            return self._replay(stored, fingerprint)
         raise RuleViolation(reason, failure_code=code, details=details or {})
 
     def _replay(

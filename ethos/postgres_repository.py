@@ -24,6 +24,7 @@ from ethos.errors import (
     IDEMPOTENCY_UNIQUE_CONSTRAINT,
     IdempotencyKeyReused,
     NotFoundError,
+    ProtocolError,
     VersionConflict,
 )
 from ethos.models import (
@@ -34,7 +35,7 @@ from ethos.models import (
     EnvironmentSnapshot,
     EnvironmentState,
 )
-from ethos.repository import EnvironmentHead, genesis_head
+from ethos.repository import EnvironmentHead, VerificationView, genesis_head
 from ethos.runtime import to_plain
 from ethos.state import replay
 
@@ -67,6 +68,11 @@ _EVENT_COLUMNS = (
 _SELECT_EVENTS = (
     f"select {', '.join(_EVENT_COLUMNS)} from environment_events "
     "where environment_id = %s and sequence > %s order by sequence"
+)
+
+_SELECT_EVENTS_ALL = (
+    f"select {', '.join(_EVENT_COLUMNS)} from environment_events "
+    "where environment_id = %s order by sequence"
 )
 
 _SELECT_EVENT_BY_KEY = (
@@ -155,6 +161,20 @@ def _event_values(event: EnvironmentEvent) -> tuple[Any, ...]:
         event.prev_event_digest,
         event.event_digest,
         event.created_at,
+    )
+
+
+def _snapshot_from_row(row: Mapping[str, Any]) -> EnvironmentSnapshot:
+    return EnvironmentSnapshot(
+        id=row["id"],
+        environment_id=row["environment_id"],
+        version=row["version"],
+        last_event_sequence=row["last_event_sequence"],
+        state=EnvironmentState.model_validate(row["state"]),
+        state_hash=row["state_hash"],
+        kind=row["kind"],
+        label=row["label"],
+        created_at=row["created_at"],
     )
 
 
@@ -264,19 +284,54 @@ class PostgresRepository:
     def latest_snapshot(self, environment_id: Any) -> EnvironmentSnapshot | None:
         with self._connect() as connection:
             row = connection.execute(_SELECT_SNAPSHOT, (environment_id,)).fetchone()
-        if row is None:
-            return None
-        return EnvironmentSnapshot(
-            id=row["id"],
-            environment_id=row["environment_id"],
-            version=row["version"],
-            last_event_sequence=row["last_event_sequence"],
-            state=EnvironmentState.model_validate(row["state"]),
-            state_hash=row["state_hash"],
-            kind=row["kind"],
-            label=row["label"],
-            created_at=row["created_at"],
+        return None if row is None else _snapshot_from_row(row)
+
+    def verification_view(self, environment_id: Any) -> VerificationView:
+        """Head, log and state from one REPEATABLE READ snapshot.
+
+        Read across three separate transactions they can disagree: an event
+        committed between reading the head and reading the log looks exactly like
+        a tampered chain. One snapshot makes the comparison meaningful.
+        """
+        connection = self._connect()
+        try:
+            connection.isolation_level = psycopg.IsolationLevel.REPEATABLE_READ
+            connection.read_only = True
+            with connection:
+                head_row = connection.execute(
+                    _SELECT_HEAD, (environment_id,)
+                ).fetchone()
+                event_rows = connection.execute(
+                    _SELECT_EVENTS_ALL, (environment_id,)
+                ).fetchall()
+                snapshot_row = connection.execute(
+                    _SELECT_SNAPSHOT, (environment_id,)
+                ).fetchone()
+        finally:
+            connection.close()
+
+        events = [_event_from_row(row) for row in event_rows]
+        if head_row is None and not events:
+            raise NotFoundError(
+                f"environment {environment_id} does not exist",
+                details={"environment_id": str(environment_id)},
+            )
+        head = (
+            genesis_head(environment_id)
+            if head_row is None
+            else EnvironmentHead(
+                environment_id=environment_id,
+                version=head_row["version"],
+                last_event_sequence=head_row["last_event_sequence"],
+                last_event_digest=head_row["last_event_digest"],
+            )
         )
+        snapshot = None if snapshot_row is None else _snapshot_from_row(snapshot_row)
+        start = snapshot.last_event_sequence if snapshot is not None else 0
+        state = replay(
+            [event for event in events if event.sequence > start], snapshot=snapshot
+        )
+        return VerificationView(head=head, events=events, state=state)
 
     def load(self, environment_id: Any) -> EnvironmentState:
         snapshot = self.latest_snapshot(environment_id)
@@ -297,10 +352,25 @@ class PostgresRepository:
         state: EnvironmentState,
         head: EnvironmentHead,
         event: EnvironmentEvent,
-    ) -> None:
+    ) -> EnvironmentEvent:
         environment = state.environment
         try:
             with self._connect() as connection, connection.transaction():
+                # READ COMMITTED (the default) plus a per-environment advisory
+                # lock. The advisory lock also covers bootstrap, where there is
+                # no environment row to lock yet.
+                connection.execute(
+                    "select pg_advisory_xact_lock(hashtext(%s))",
+                    (str(environment.id),),
+                )
+                # Checked under the lock: two simultaneous identical requests
+                # produce one event and one replay, never a spurious conflict.
+                existing = connection.execute(
+                    _SELECT_EVENT_BY_KEY, (environment.id, event.idempotency_key)
+                ).fetchone()
+                if existing is not None:
+                    return _event_from_row(existing)
+
                 if event.sequence == 1:
                     connection.execute(
                         "insert into environments (id, name, description, config, "
@@ -321,31 +391,46 @@ class PostgresRepository:
                         ),
                     )
                 else:
-                    cursor = connection.execute(
-                        "update environments set version = %s, "
-                        "last_event_sequence = %s, last_event_digest = %s, "
-                        "updated_at = %s "
-                        "where id = %s and version = %s and last_event_sequence = %s",
-                        (
-                            head.version,
-                            head.last_event_sequence,
-                            head.last_event_digest,
-                            environment.updated_at,
-                            environment.id,
-                            event.prev_state_version,
-                            event.sequence - 1,
-                        ),
-                    )
-                    if cursor.rowcount != 1:
+                    # Lock the row before allocating the next sequence, so the
+                    # head is read and advanced under one writer at a time.
+                    head_row = connection.execute(
+                        "select version, last_event_sequence, last_event_digest "
+                        "from environments where id = %s for update",
+                        (environment.id,),
+                    ).fetchone()
+                    if head_row is None:
+                        raise ProtocolError(
+                            f"environment {environment.id} has no row to append to"
+                        )
+                    if (
+                        head_row["version"] != event.prev_state_version
+                        or head_row["last_event_sequence"] != event.sequence - 1
+                        or head_row["last_event_digest"] != event.prev_event_digest
+                    ):
                         raise VersionConflict(
                             "the environment changed while this action was being "
                             "applied; retry with the current version",
                             details={
                                 "environment_id": str(environment.id),
                                 "expected_version": event.prev_state_version,
+                                "current_version": head_row["version"],
                                 "sequence": event.sequence,
                             },
                         )
+                    cursor = connection.execute(
+                        "update environments set version = %s, "
+                        "last_event_sequence = %s, last_event_digest = %s, "
+                        "updated_at = %s where id = %s",
+                        (
+                            head.version,
+                            head.last_event_sequence,
+                            head.last_event_digest,
+                            environment.updated_at,
+                            environment.id,
+                        ),
+                    )
+                    if cursor.rowcount != 1:
+                        raise ProtocolError("environment row vanished mid-transaction")
                 # Entities are written before the event: the event references
                 # the actor, and on bootstrap the actor is created by it.
                 for change in event.changes.changes:
@@ -355,8 +440,13 @@ class PostgresRepository:
                         continue
                     _apply_change(connection, change, environment.id)
                 connection.execute(_INSERT_EVENT, _event_values(event))
+                return event
         except psycopg.errors.UniqueViolation as exc:
             if (exc.diag.constraint_name or "") == IDEMPOTENCY_UNIQUE_CONSTRAINT:
+                # Last line of defence: the winner's event is authoritative.
+                duplicate = self.find_event(environment.id, event.idempotency_key)
+                if duplicate is not None:
+                    return duplicate
                 raise IdempotencyKeyReused(
                     f"idempotency key {event.idempotency_key!r} was already used",
                     details={"idempotency_key": event.idempotency_key},

@@ -176,13 +176,14 @@ def check_integrity(
     environment_id: UUID, request: Request, deep: bool = Query(default=True)
 ) -> IntegrityResponse:
     service = _service(request, environment_id)
-    state = service.repository.load(environment_id)
-    head = service.repository.head(environment_id)
+    # One snapshot for head, log and state: read separately they can legitimately
+    # disagree while another writer commits, which would look like tampering.
+    view = service.repository.verification_view(environment_id)
     report = verify_event_chain(
-        service.repository.events(environment_id),
-        head_sequence=head.last_event_sequence,
-        head_digest=head.last_event_digest,
-        current_state=state,
+        view.events,
+        head_sequence=view.head.last_event_sequence,
+        head_digest=view.head.last_event_digest,
+        current_state=view.state,
         deep=deep,
     )
     return IntegrityResponse(

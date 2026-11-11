@@ -58,6 +58,9 @@ class Settings:
     snapshot_interval: int = 25
     max_simulation_actions: int = 50
     test_database_url: str | None = None
+    # Administrative credential, used only by integration-test setup and
+    # teardown. The runtime role deliberately cannot delete rows.
+    admin_database_url: str | None = None
     allow_integration_writes: bool = False
 
     @classmethod
@@ -89,6 +92,7 @@ class Settings:
             snapshot_interval=integer("ETHOS_SNAPSHOT_INTERVAL", 25),
             max_simulation_actions=integer("ETHOS_MAX_SIMULATION_ACTIONS", 50),
             test_database_url=text("ETHOS_TEST_DATABASE_URL"),
+            admin_database_url=text("ETHOS_ADMIN_DATABASE_URL"),
             allow_integration_writes=_flag(source, "ETHOS_ALLOW_INTEGRATION_WRITES"),
         )
 

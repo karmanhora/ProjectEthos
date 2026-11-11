@@ -29,14 +29,19 @@ pytestmark = pytest.mark.integration
 
 SETTINGS = Settings.from_env()
 
-if not (SETTINGS.test_database_url and SETTINGS.allow_integration_writes):
+if not (
+    SETTINGS.test_database_url
+    and SETTINGS.admin_database_url
+    and SETTINGS.allow_integration_writes
+):
     pytest.skip(
-        "integration tests need ETHOS_TEST_DATABASE_URL and "
-        "ETHOS_ALLOW_INTEGRATION_WRITES=1",
+        "integration tests need ETHOS_TEST_DATABASE_URL, "
+        "ETHOS_ADMIN_DATABASE_URL and ETHOS_ALLOW_INTEGRATION_WRITES=1",
         allow_module_level=True,
     )
 
 DSN = SETTINGS.test_database_url
+ADMIN_DSN = SETTINGS.admin_database_url
 NOW = datetime(2026, 11, 11, 12, 0, 0, tzinfo=timezone.utc)
 ID_NAMESPACE = UUID("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee")
 
@@ -60,7 +65,9 @@ def service(environment_id):
 @pytest.fixture(autouse=True)
 def cleanup(environment_id):
     yield
-    with psycopg.connect(DSN) as connection:
+    # Administrative credential: the runtime role has no DELETE by design, so
+    # teardown must never run as ethos_app.
+    with psycopg.connect(ADMIN_DSN) as connection:
         for table in (
             "environment_snapshots",
             "environment_events",

@@ -16,7 +16,7 @@ from uuid import UUID
 
 from pydantic import Field
 
-from ethos.errors import NotFoundError, ProtocolError
+from ethos.errors import NotFoundError, ProtocolError, VersionConflict
 from ethos.models import EnvironmentEvent, EnvironmentSnapshot, EnvironmentState
 from ethos.runtime import GENESIS_EVENT_DIGEST, FrozenModel
 from ethos.state import replay
@@ -25,6 +25,7 @@ __all__ = [
     "EnvironmentHead",
     "EnvironmentRepository",
     "InMemoryRepository",
+    "VerificationView",
     "genesis_head",
 ]
 
@@ -48,6 +49,19 @@ def genesis_head(environment_id: UUID) -> EnvironmentHead:
     )
 
 
+class VerificationView(FrozenModel):
+    """Head, log and state read from one snapshot.
+
+    Verifying integrity against separately-read parts can report a divergence
+    that never existed: an event can be committed between reading the head and
+    reading the log. All three must come from one consistent read.
+    """
+
+    head: EnvironmentHead
+    events: list[EnvironmentEvent] = []
+    state: EnvironmentState
+
+
 class EnvironmentRepository(Protocol):
     def head(self, environment_id: UUID) -> EnvironmentHead: ...
 
@@ -69,7 +83,16 @@ class EnvironmentRepository(Protocol):
         state: EnvironmentState,
         head: EnvironmentHead,
         event: EnvironmentEvent,
-    ) -> None: ...
+    ) -> EnvironmentEvent:
+        """Commit one event.
+
+        Returns the event that is actually stored. When another writer already
+        committed the same idempotency key, that stored event is returned
+        instead of the one offered here, so the caller can replay its outcome.
+        """
+        ...
+
+    def verification_view(self, environment_id: UUID) -> VerificationView: ...
 
     def save_snapshot(self, snapshot: EnvironmentSnapshot) -> None: ...
 
@@ -132,7 +155,7 @@ class InMemoryRepository:
         state: EnvironmentState,
         head: EnvironmentHead,
         event: EnvironmentEvent,
-    ) -> None:
+    ) -> EnvironmentEvent:
         """Commit one event. Every check here is an internal invariant, so a
         violation means the service produced an impossible transition."""
         with self._lock:
@@ -141,6 +164,13 @@ class InMemoryRepository:
                 state.environment_id == environment_id == head.environment_id
             ):
                 raise ProtocolError("event, state and head disagree on the environment")
+
+            key = (environment_id, event.idempotency_key)
+            stored = self._idempotency.get(key)
+            if stored is not None:
+                # A concurrent duplicate lost the race. Returning the stored
+                # event lets the caller replay it rather than report a conflict.
+                return stored
 
             if event.event_digest != event.compute_digest():
                 raise ProtocolError(
@@ -161,19 +191,24 @@ class InMemoryRepository:
                 if event.prev_event_digest != GENESIS_EVENT_DIGEST:
                     raise ProtocolError("the first event must chain from genesis")
             else:
-                if event.sequence != previous.sequence + 1:
-                    raise ProtocolError(
-                        f"event sequence {event.sequence} does not follow "
-                        f"{previous.sequence}"
+                if (
+                    event.sequence != previous.sequence + 1
+                    or event.prev_state_version != base_version
+                ):
+                    # Checked before the digest: a stale writer built its event
+                    # from an older head, so its chain link legitimately differs.
+                    # That is a retryable conflict, not a broken invariant.
+                    raise VersionConflict(
+                        "the environment changed while this action was being applied",
+                        details={
+                            "environment_id": str(environment_id),
+                            "expected_version": event.prev_state_version,
+                            "current_version": base_version,
+                        },
                     )
                 if event.prev_event_digest != previous.event_digest:
                     raise ProtocolError(
                         f"event {event.sequence} does not chain to its predecessor"
-                    )
-                if event.prev_state_version != base_version:
-                    raise ProtocolError(
-                        f"event {event.sequence} does not start from head version "
-                        f"{base_version}"
                     )
 
             expected_version = (
@@ -200,15 +235,31 @@ class InMemoryRepository:
                     "state version does not match the version the event records"
                 )
 
-            key = (environment_id, event.idempotency_key)
-            if key in self._idempotency:
-                raise ProtocolError(
-                    f"idempotency key {event.idempotency_key!r} was already used"
-                )
-
             self._events.setdefault(environment_id, []).append(event)
             self._idempotency[key] = event
             self._heads[environment_id] = head
+            return event
+
+    def verification_view(self, environment_id: UUID) -> VerificationView:
+        """Head, log and state under one lock, so they cannot disagree."""
+        with self._lock:
+            events = list(self._events.get(environment_id, ()))
+            snapshot = self.latest_snapshot(environment_id)
+            if snapshot is None and not events:
+                raise NotFoundError(
+                    f"environment {environment_id} does not exist",
+                    details={"environment_id": str(environment_id)},
+                )
+            start = snapshot.last_event_sequence if snapshot is not None else 0
+            state = replay(
+                [event for event in events if event.sequence > start],
+                snapshot=snapshot,
+            )
+            return VerificationView(
+                head=self._heads.get(environment_id, genesis_head(environment_id)),
+                events=events,
+                state=state,
+            )
 
     def save_snapshot(self, snapshot: EnvironmentSnapshot) -> None:
         with self._lock:

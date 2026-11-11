@@ -1,3 +1,5 @@
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from uuid import UUID, uuid4
 
@@ -376,3 +378,130 @@ def test_invalid_parameters_are_rejected():
     service, _, boot = bootstrapped()
     with pytest.raises(ValidationError):
         act(service, "project.create", boot.event.actor_user_id, {}, "k-invalid")
+
+
+# --- idempotency and concurrency -------------------------------------------
+
+
+def test_expected_version_is_part_of_the_fingerprint():
+    service, _, boot = bootstrapped()
+    owner = boot.event.actor_user_id
+    act(
+        service,
+        "project.create",
+        owner,
+        {"key": "ENG", "name": "Eng"},
+        "k-versioned",
+        expected_version=1,
+    )
+    # Same key and parameters, different assertion about the world: not a replay.
+    with pytest.raises(IdempotencyKeyReused):
+        act(
+            service,
+            "project.create",
+            owner,
+            {"key": "ENG", "name": "Eng"},
+            "k-versioned",
+            expected_version=None,
+        )
+
+
+def test_concurrent_identical_requests_share_one_event():
+    repository = InMemoryRepository()
+    service = EnvironmentService(repository, ENV_ID)  # real clock and ids
+    boot = service.bootstrap(
+        name="demo",
+        org_name="Acme",
+        org_slug="acme",
+        owner_handle="ada",
+        owner_display_name="Ada Lovelace",
+    )
+    request = ActionRequest(
+        action_type="project.create",
+        actor_user_id=boot.event.actor_user_id,
+        parameters={"key": "ENG", "name": "Eng"},
+        idempotency_key="race-identical",
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(service.execute, request) for _ in range(2)]
+        results = [future.result() for future in futures]
+
+    assert results[0].event.id == results[1].event.id
+    assert {result.state.version for result in results} == {2}
+    assert len(repository.events(ENV_ID)) == 2
+    assert repository.head(ENV_ID).last_event_sequence == 2
+
+
+class RacingRepository(InMemoryRepository):
+    """Releases both writers only once each has read the same head."""
+
+    def __init__(self):
+        super().__init__()
+        self.barrier: threading.Barrier | None = None
+
+    def head(self, environment_id):
+        value = super().head(environment_id)
+        if self.barrier is not None:
+            try:
+                self.barrier.wait(timeout=5)
+            except threading.BrokenBarrierError:
+                pass
+        return value
+
+
+def test_concurrent_writes_with_different_keys_conflict():
+    repository = RacingRepository()
+    service = EnvironmentService(repository, ENV_ID)
+    boot = service.bootstrap(
+        name="demo",
+        org_name="Acme",
+        org_slug="acme",
+        owner_handle="ada",
+        owner_display_name="Ada Lovelace",
+    )
+    owner = boot.event.actor_user_id
+    repository.barrier = threading.Barrier(2)
+
+    def write(index: int):
+        return service.execute(
+            ActionRequest(
+                action_type="project.create",
+                actor_user_id=owner,
+                parameters={"key": f"ENG{index}", "name": f"Eng {index}"},
+                idempotency_key=f"race-{index}",
+            )
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(write, index) for index in (0, 1)]
+        outcomes: list = []
+        for future in futures:
+            try:
+                outcomes.append(future.result())
+            except VersionConflict as exc:
+                outcomes.append(exc)
+
+    conflicts = [item for item in outcomes if isinstance(item, VersionConflict)]
+    successes = [item for item in outcomes if not isinstance(item, Exception)]
+    assert len(conflicts) == 1
+    assert len(successes) == 1
+    assert len(repository.events(ENV_ID)) == 2
+
+
+def test_verification_view_is_internally_consistent():
+    service, repository, boot = bootstrapped()
+    owner = boot.event.actor_user_id
+    create_project(service, owner)
+
+    view = repository.verification_view(ENV_ID)
+    assert view.head.last_event_sequence == 2
+    assert len(view.events) == 2
+    report = verify_event_chain(
+        view.events,
+        head_sequence=view.head.last_event_sequence,
+        head_digest=view.head.last_event_digest,
+        current_state=view.state,
+    )
+    assert report.valid, report.divergence
+    assert report.final_version == view.state.version
