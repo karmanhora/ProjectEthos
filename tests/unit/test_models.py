@@ -29,10 +29,6 @@ PROJECT_ID = UUID("44444444-4444-4444-8444-444444444444")
 USER_ID = UUID("55555555-5555-4555-8555-555555555555")
 
 
-class Row(str):
-    """Sentinel type is unnecessary; Any fields accept UUIDs."""
-
-
 def make_environment(version: int = 1) -> Environment:
     return Environment(
         id=ENV_ID,
@@ -105,7 +101,7 @@ def test_change_set_summary_counts_by_type_and_op():
                 op=ChangeOp.UPDATE,
                 entity_type=EntityType.TASK,
                 entity_id=TASK_ID,
-                fields=[]
+                fields=[],
             ),
         ]
     )
@@ -140,17 +136,26 @@ def test_digest_is_stable_and_covers_metadata():
     assert first == digest_of(dict(base))
     assert len(first) == 64
 
-    changed_actor = dict(base, actor_user_id=None)
-    assert digest_of(changed_actor) != first
-
-    changed_params = dict(base, parameters={"title": "y"})
-    assert digest_of(changed_params) != first
+    assert digest_of(dict(base, actor_user_id=None)) != first
+    assert digest_of(dict(base, parameters={"title": "y"})) != first
+    assert digest_of(dict(base, status="failed", failure_code="RULE_VIOLATION")) != first
 
 
 def test_organization_rejects_empty_name():
     with pytest.raises(ValidationError):
         Organization(
             id=ORG_ID, environment_id=ENV_ID, name="", slug="acme", created_at=NOW
+        )
+
+
+def test_identifier_must_be_a_uuid():
+    with pytest.raises(ValidationError):
+        Organization(
+            id="not-a-uuid",  # type: ignore[arg-type]
+            environment_id=ENV_ID,
+            name="Acme",
+            slug="acme",
+            created_at=NOW,
         )
 
 

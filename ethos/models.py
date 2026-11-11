@@ -12,6 +12,7 @@ from __future__ import annotations
 from datetime import date, datetime
 from enum import Enum
 from typing import Any, Literal, Mapping
+from uuid import UUID
 
 from pydantic import Field
 
@@ -92,8 +93,8 @@ class EnvironmentRules(FrozenModel):
 
 
 class Organization(FrozenModel):
-    id: Any
-    environment_id: Any
+    id: UUID
+    environment_id: UUID
     name: str = Field(min_length=1, max_length=120)
     slug: str = Field(min_length=2, max_length=40)
     created_at: datetime
@@ -106,9 +107,9 @@ class EnvironmentUser(FrozenModel):
     relation to any auth schema.
     """
 
-    id: Any
-    environment_id: Any
-    org_id: Any
+    id: UUID
+    environment_id: UUID
+    org_id: UUID
     handle: str = Field(min_length=3, max_length=40)
     display_name: str = Field(min_length=1, max_length=120)
     org_role: OrgRole = OrgRole.MEMBER
@@ -118,36 +119,36 @@ class EnvironmentUser(FrozenModel):
 
 
 class Team(FrozenModel):
-    id: Any
-    environment_id: Any
-    org_id: Any
+    id: UUID
+    environment_id: UUID
+    org_id: UUID
     key: str = Field(min_length=2, max_length=10)
     name: str = Field(min_length=1, max_length=120)
     created_at: datetime
 
 
 class TeamMembership(FrozenModel):
-    id: Any
-    environment_id: Any
-    team_id: Any
-    user_id: Any
+    id: UUID
+    environment_id: UUID
+    team_id: UUID
+    user_id: UUID
     role: TeamRole = TeamRole.MEMBER
-    added_by_id: Any | None = None
+    added_by_id: UUID | None = None
     added_at: datetime
     removed_at: datetime | None = None
-    removed_by_id: Any | None = None
+    removed_by_id: UUID | None = None
 
 
 class Project(FrozenModel):
-    id: Any
-    environment_id: Any
-    org_id: Any
+    id: UUID
+    environment_id: UUID
+    org_id: UUID
     key: str = Field(min_length=2, max_length=10)
     name: str = Field(min_length=1, max_length=120)
     description: str | None = None
     status: ProjectStatus = ProjectStatus.ACTIVE
-    lead_user_id: Any | None = None
-    created_by_id: Any
+    lead_user_id: UUID | None = None
+    created_by_id: UUID
     started_on: date | None = None
     target_on: date | None = None
     created_at: datetime
@@ -155,26 +156,26 @@ class Project(FrozenModel):
 
 
 class ProjectMembership(FrozenModel):
-    id: Any
-    environment_id: Any
-    project_id: Any
-    user_id: Any
+    id: UUID
+    environment_id: UUID
+    project_id: UUID
+    user_id: UUID
     role: ProjectRole = ProjectRole.CONTRIBUTOR
-    added_by_id: Any | None = None
+    added_by_id: UUID | None = None
     added_at: datetime
     removed_at: datetime | None = None
 
 
 class Task(FrozenModel):
-    id: Any
-    environment_id: Any
-    project_id: Any
+    id: UUID
+    environment_id: UUID
+    project_id: UUID
     title: str = Field(min_length=1, max_length=200)
     description: str | None = None
     status: TaskStatus = TaskStatus.TODO
     priority: TaskPriority = TaskPriority.MEDIUM
     task_type: TaskType = TaskType.TASK
-    created_by_id: Any
+    created_by_id: UUID
     due_on: date | None = None
     completed_at: datetime | None = None
     created_at: datetime
@@ -182,28 +183,28 @@ class Task(FrozenModel):
 
 
 class TaskAssignment(FrozenModel):
-    id: Any
-    environment_id: Any
-    task_id: Any
-    user_id: Any
-    assigned_by_id: Any
+    id: UUID
+    environment_id: UUID
+    task_id: UUID
+    user_id: UUID
+    assigned_by_id: UUID
     assigned_at: datetime
     removed_at: datetime | None = None
 
 
 class TaskDependency(FrozenModel):
-    id: Any
-    environment_id: Any
-    task_id: Any
-    depends_on_task_id: Any
-    created_by_id: Any
+    id: UUID
+    environment_id: UUID
+    task_id: UUID
+    depends_on_task_id: UUID
+    created_by_id: UUID
     created_at: datetime
 
 
 class Environment(FrozenModel):
     """The environment row: config, state version, and the event-log head."""
 
-    id: Any
+    id: UUID
     name: str = Field(min_length=1, max_length=120)
     description: str | None = None
     config: EnvironmentRules = EnvironmentRules()
@@ -219,18 +220,18 @@ class EnvironmentState(FrozenModel):
     """The whole environment: one immutable object, the unit of every operation."""
 
     environment: Environment
-    organizations: dict[Any, Organization] = {}
-    users: dict[Any, EnvironmentUser] = {}
-    teams: dict[Any, Team] = {}
-    team_memberships: dict[Any, TeamMembership] = {}
-    projects: dict[Any, Project] = {}
-    project_memberships: dict[Any, ProjectMembership] = {}
-    tasks: dict[Any, Task] = {}
-    task_assignments: dict[Any, TaskAssignment] = {}
-    task_dependencies: dict[Any, TaskDependency] = {}
+    organizations: dict[UUID, Organization] = {}
+    users: dict[UUID, EnvironmentUser] = {}
+    teams: dict[UUID, Team] = {}
+    team_memberships: dict[UUID, TeamMembership] = {}
+    projects: dict[UUID, Project] = {}
+    project_memberships: dict[UUID, ProjectMembership] = {}
+    tasks: dict[UUID, Task] = {}
+    task_assignments: dict[UUID, TaskAssignment] = {}
+    task_dependencies: dict[UUID, TaskDependency] = {}
 
     @property
-    def environment_id(self) -> Any:
+    def environment_id(self) -> UUID:
         return self.environment.id
 
     @property
@@ -264,12 +265,16 @@ class FieldChange(FrozenModel):
 
 
 class EntityChange(FrozenModel):
-    """One entity transition. `create` carries every column; `delete` carries
-    every column; `update` carries exactly the differing fields."""
+    """One entity transition.
+
+    `create` and `delete` carry every column of the entity; `update` carries
+    exactly the differing fields with both values. That losslessness is what
+    lets a recorded change set be replayed without reading anything else.
+    """
 
     op: ChangeOp
     entity_type: EntityType
-    entity_id: Any
+    entity_id: UUID
     fields: list[FieldChange] = []
     before: dict[str, Any] | None = None
     after: dict[str, Any] | None = None
@@ -288,7 +293,9 @@ class ChangeSet(FrozenModel):
     def changed_entity_ids(self) -> dict[str, list[str]]:
         grouped: dict[str, list[str]] = {}
         for change in self.changes:
-            grouped.setdefault(change.entity_type.value, []).append(str(change.entity_id))
+            grouped.setdefault(change.entity_type.value, []).append(
+                str(change.entity_id)
+            )
         return grouped
 
 
@@ -327,11 +334,11 @@ def digest_of(values: Mapping[str, Any]) -> str:
 
 
 class EnvironmentEvent(FrozenModel):
-    id: Any
-    environment_id: Any
+    id: UUID
+    environment_id: UUID
     sequence: int = Field(ge=1)
     action_type: str
-    actor_user_id: Any | None = None
+    actor_user_id: UUID | None = None
     origin: Literal["bootstrap", "api"] = "api"
     parameters: dict[str, Any] = {}
     changes: ChangeSet = ChangeSet()
@@ -354,8 +361,8 @@ class EnvironmentEvent(FrozenModel):
 
 
 class EnvironmentSnapshot(FrozenModel):
-    id: Any
-    environment_id: Any
+    id: UUID
+    environment_id: UUID
     version: int = Field(ge=1)
     last_event_sequence: int = Field(ge=1)
     state: EnvironmentState
