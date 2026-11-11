@@ -1,8 +1,8 @@
 """Static checks over the grants migration.
 
 These cannot prove the SQL runs, but they do prove the guarantees are still
-written down: a later edit that deletes the anon revokes, or reintroduces a
-table-wide UPDATE, fails here without needing a database.
+written down: a later edit that deletes the anon revokes, reintroduces a
+table-wide UPDATE, or drops a validation, fails here without a database.
 """
 from pathlib import Path
 
@@ -48,6 +48,9 @@ def test_every_table_is_named(table):
     assert f"'{table}'" in SQL
 
 
+# --- anon / authenticated table access --------------------------------------
+
+
 def test_anon_and_authenticated_are_revoked():
     assert "array['anon', 'authenticated']" in SQL
     assert "revoke all privileges on table public.%I from %I" in SQL
@@ -57,20 +60,9 @@ def test_public_is_revoked_from_tables():
     assert "revoke all privileges on table public.%I from public" in SQL
 
 
-def test_default_privileges_are_revoked():
-    assert "alter default privileges in schema public revoke all on tables" in LOWER
-    assert "alter default privileges in schema public revoke all on sequences" in LOWER
-
-
 def test_membership_inheritance_is_checked():
     assert "pg_auth_members" in SQL
     assert "inherits privileges through" in LOWER
-
-
-def test_default_acl_is_checked():
-    assert "pg_default_acl" in SQL
-    assert "aclexplode" in LOWER
-    assert "can still reach future ethos tables" in LOWER
 
 
 def test_privileges_are_asserted_absent():
@@ -82,6 +74,52 @@ def test_roles_are_guarded_on_existence():
     # A bare Postgres has no anon/authenticated; naming them unguarded would
     # abort the migration instead of skipping the revoke.
     assert "from pg_roles where rolname = role_name" in LOWER
+
+
+# --- default privileges -----------------------------------------------------
+
+
+def test_schema_scoped_defaults_are_revoked():
+    assert "alter default privileges in schema public revoke all on tables" in LOWER
+    assert "alter default privileges in schema public revoke all on sequences" in LOWER
+
+
+def test_global_defaults_are_not_rewritten_unconditionally():
+    # The global scope is shared with every other schema in the database, and
+    # that the project is dedicated to Ethos cannot be established from this
+    # repository. The migration must refuse rather than mutate it.
+    assert "alter default privileges revoke all" not in LOWER
+    assert "does not rewrite global default privileges" in LOWER
+
+
+def test_default_acl_validation_is_checked():
+    assert "pg_default_acl" in SQL
+    assert "aclexplode" in LOWER
+    assert "can still reach future ethos objects" in LOWER
+
+
+def test_default_acl_validation_covers_global_scope():
+    assert "defaults.defaclnamespace = 0 or namespace.nspname = 'public'" in SQL
+
+
+def test_default_acl_validation_filters_object_types():
+    assert "defaults.defaclobjtype in ('r', 'S')" in SQL
+    # Function, type and schema defaults cannot expose table data.
+    assert "out of scope" in LOWER
+
+
+def test_remedy_matches_object_type_and_scope():
+    assert "case offending.object_type when 'r' then 'tables' else 'sequences'" in LOWER
+    assert "alter default privileges for role %i %srevoke all on %s from %i;" in LOWER
+    assert "case when offending.is_global then '' else 'in schema public ' end" in LOWER
+
+
+def test_global_default_failure_names_owning_role():
+    assert "defaclrole" in SQL
+    assert "confirm the blast radius" in LOWER
+
+
+# --- ethos_app --------------------------------------------------------------
 
 
 def test_ethos_app_keeps_least_privilege_grants():
@@ -98,36 +136,29 @@ def test_ethos_app_append_only_tables_are_locked_down():
     assert "revoke update, delete, truncate on environment_snapshots" in LOWER
 
 
+def test_ethos_app_positive_control_is_asserted():
+    assert "ethos_app lost select" in LOWER
+    assert "ethos_app lost insert" in LOWER
+
+
+def test_ethos_app_memberships_are_checked():
+    # NOINHERIT blocks automatic inheritance, but SET ROLE still reaches a
+    # granted role, so membership alone is an escalation path.
+    assert "grant_path" in SQL
+    assert "ethos_app is a member of" in LOWER
+    assert "remove the membership manually" in LOWER
+
+
+# --- RLS --------------------------------------------------------------------
+
+
 def test_rls_policies_are_preserved():
     assert "enable row level security" in LOWER
     assert "force row level security" in LOWER
     assert "create policy ethos_app_access" in LOWER
 
 
-def test_ethos_app_positive_control_is_asserted():
-    assert "ethos_app lost select" in LOWER
-    assert "ethos_app lost insert" in LOWER
-
-
-def test_global_default_privileges_are_revoked():
-    # Without FOR ROLE / IN SCHEMA this is the global default scope, the only
-    # one a schema-level REVOKE cannot reach.
-    assert "alter default privileges revoke all on tables" in LOWER
-    assert "alter default privileges revoke all on sequences" in LOWER
-
-
-def test_schema_scoped_defaults_are_still_revoked():
-    assert "alter default privileges in schema public revoke all on tables" in LOWER
-
-
-def test_default_privilege_validation_covers_global_scope():
-    assert "defaults.defaclnamespace = 0 or namespace.nspname = 'public'" in SQL
-
-
-def test_global_default_failure_names_owner_and_remedy():
-    assert "defaclrole" in SQL
-    assert "alter default privileges for role %i" in LOWER
-    assert "cannot cancel a global default" in LOWER
+# --- PostgreSQL 17 MAINTAIN ------------------------------------------------
 
 
 def test_maintain_is_version_gated():

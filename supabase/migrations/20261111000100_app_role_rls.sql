@@ -174,34 +174,28 @@ begin
 end
 $$;
 
--- Default privileges decide what a *future* table grants. PostgreSQL keeps two
--- kinds: schema-specific (defaclnamespace = that schema) and global
--- (defaclnamespace = 0), which applies to every schema the owning role creates
--- in. They are applied additively at CREATE TABLE time and privileges have no
--- negative form, so a schema-level REVOKE cannot subtract a global GRANT. Both
--- scopes must be revoked, and both are validated below.
+-- Default privileges decide what a *future* table or sequence grants.
+-- PostgreSQL keeps two scopes: schema-specific (defaclnamespace = that schema)
+-- and global (defaclnamespace = 0), which applies to objects the owning role
+-- creates in any schema. They are applied additively at CREATE time and
+-- privileges have no negative form, so a schema-level REVOKE cannot subtract a
+-- global GRANT.
 --
--- A REVOKE without FOR ROLE only touches the defaults of the role running the
--- migration, which is the role that creates these tables. Defaults owned by a
--- different role are deliberately not rewritten here: validation reports them
--- with the exact remedy rather than leaving the guarantee silently unmet.
+-- Only the schema-scoped defaults are rewritten here. That revoke is bounded to
+-- public, the schema the Ethos tables occupy: it does affect future objects
+-- created there by this role, which is exactly the guarantee being established.
 --
--- Blast radius: revoking globally removes anon/authenticated from defaults for
--- tables this role creates in *any* schema, not just public. That is the only
--- scope that can guarantee the Ethos tables, and this database has no other
--- application relying on those grants.
+-- The global scope is deliberately NOT rewritten. It belongs to a role shared
+-- with every other schema in this database, and nothing in this repository
+-- establishes that the project is dedicated to Ethos. A global revoke would
+-- silently change default privileges for unrelated schemas, so that decision is
+-- left to a human and validation fails with the exact remedy instead.
 do $$
 declare
     role_name text;
 begin
     foreach role_name in array array['anon', 'authenticated'] loop
         if exists (select 1 from pg_roles where rolname = role_name) then
-            execute format(
-                'alter default privileges revoke all on tables from %I', role_name
-            );
-            execute format(
-                'alter default privileges revoke all on sequences from %I', role_name
-            );
             execute format(
                 'alter default privileges in schema public revoke all on tables from %I',
                 role_name
@@ -212,8 +206,6 @@ begin
             );
         end if;
     end loop;
-    execute 'alter default privileges revoke all on tables from public';
-    execute 'alter default privileges revoke all on sequences from public';
     execute 'alter default privileges in schema public revoke all on tables from public';
     execute 'alter default privileges in schema public revoke all on sequences from public';
 end
@@ -331,10 +323,12 @@ begin
 end
 $$;
 
--- 3. No default privilege, in this schema or globally, still names anon,
---    authenticated or PUBLIC. Global entries (defaclnamespace = 0) are the
---    dangerous ones: they apply to tables created in any schema by their owning
---    role, and no schema-level REVOKE can subtract them.
+-- 3. No default privilege of a type that can expose Ethos data - tables and
+--    sequences - still names anon, authenticated or PUBLIC, in this schema or
+--    globally. Function, type and schema defaults cannot grant table access and
+--    are deliberately out of scope, so they must not trigger this failure.
+--    Global entries (defaclnamespace = 0) are the dangerous ones: they apply to
+--    objects created in any schema by their owning role.
 do $$
 declare
     offending record;
@@ -343,6 +337,8 @@ declare
 begin
     for offending in
         select owner_role.rolname as owner_name,
+               defaults.defaclnamespace = 0 as is_global,
+               defaults.defaclobjtype as object_type,
                case
                    when defaults.defaclnamespace = 0 then 'GLOBAL'
                    else namespace.nspname
@@ -358,29 +354,35 @@ begin
                  on namespace.oid = defaults.defaclnamespace
           left join pg_roles owner_role
                  on owner_role.oid = defaults.defaclrole
-         where (defaults.defaclnamespace = 0 or namespace.nspname = 'public')
+         where defaults.defaclobjtype in ('r', 'S')
+           and (defaults.defaclnamespace = 0 or namespace.nspname = 'public')
            and (acl.grantee = 0
                 or pg_get_userbyid(acl.grantee) in ('anon', 'authenticated'))
     loop
         details := details || format(
-            E'\n  %s default privileges of role %s grant %s to %s',
+            E'\n  %s %s default privileges of role %s grant %s to %s',
             offending.scope,
+            case offending.object_type when 'r' then 'TABLE' else 'SEQUENCE' end,
             offending.owner_name,
             offending.privilege_type,
             offending.grantee_name
         );
+        -- The remedy must match the entry: ON TABLES is wrong for a sequence
+        -- default, and IN SCHEMA applies only to a schema-scoped entry.
         remedy := remedy || format(
-            E'\n  ALTER DEFAULT PRIVILEGES FOR ROLE %I REVOKE ALL ON TABLES FROM %I;',
+            E'\n  ALTER DEFAULT PRIVILEGES FOR ROLE %I %sREVOKE ALL ON %s FROM %I;',
             offending.owner_name,
+            case when offending.is_global then '' else 'IN SCHEMA public ' end,
+            case offending.object_type when 'r' then 'TABLES' else 'SEQUENCES' end,
             offending.grantee_name
         );
     end loop;
 
     if details <> '' then
         raise exception
-            'default privileges can still reach future Ethos tables:%',
+            'default privileges can still reach future Ethos objects:%',
             details
-            || E'\nRun the following as a superuser; a schema-level REVOKE cannot cancel a global default:'
+            || E'\nThis migration does not rewrite global default privileges: the global scope is shared with every other schema in this database, and that the project is dedicated to Ethos cannot be established from here. Confirm the blast radius, then run the following as a superuser:'
             || remedy;
     end if;
 end
@@ -433,6 +435,29 @@ begin
         if has_table_privilege('ethos_app', 'public.environments', 'MAINTAIN') then
             raise exception 'ethos_app must not have MAINTAIN on environments';
         end if;
+    end if;
+end
+$$;
+
+-- 5. ethos_app is not a member of any other role. NOINHERIT stops a membership
+--    from applying automatically, but SET ROLE still reaches it, so a membership
+--    is a privilege-escalation path whether or not inheritance is on. This
+--    reports only; memberships are never modified here.
+do $$
+declare
+    memberships text;
+begin
+    select string_agg(parent.rolname, ', ')
+      into memberships
+      from pg_auth_members grant_path
+      join pg_roles parent on parent.oid = grant_path.roleid
+      join pg_roles grantee on grantee.oid = grant_path.member
+     where grantee.rolname = 'ethos_app';
+
+    if memberships is not null then
+        raise exception
+            'ethos_app is a member of: %; a SET ROLE path to another role is not allowed, remove the membership manually',
+            memberships;
     end if;
 end
 $$;
