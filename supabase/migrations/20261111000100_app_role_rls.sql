@@ -174,15 +174,34 @@ begin
 end
 $$;
 
--- Default privileges decide what a *future* table in this schema grants. If
--- Supabase's defaults hand new tables to anon/authenticated, the revokes above
--- would be quietly undone by the next migration that creates one.
+-- Default privileges decide what a *future* table grants. PostgreSQL keeps two
+-- kinds: schema-specific (defaclnamespace = that schema) and global
+-- (defaclnamespace = 0), which applies to every schema the owning role creates
+-- in. They are applied additively at CREATE TABLE time and privileges have no
+-- negative form, so a schema-level REVOKE cannot subtract a global GRANT. Both
+-- scopes must be revoked, and both are validated below.
+--
+-- A REVOKE without FOR ROLE only touches the defaults of the role running the
+-- migration, which is the role that creates these tables. Defaults owned by a
+-- different role are deliberately not rewritten here: validation reports them
+-- with the exact remedy rather than leaving the guarantee silently unmet.
+--
+-- Blast radius: revoking globally removes anon/authenticated from defaults for
+-- tables this role creates in *any* schema, not just public. That is the only
+-- scope that can guarantee the Ethos tables, and this database has no other
+-- application relying on those grants.
 do $$
 declare
     role_name text;
 begin
     foreach role_name in array array['anon', 'authenticated'] loop
         if exists (select 1 from pg_roles where rolname = role_name) then
+            execute format(
+                'alter default privileges revoke all on tables from %I', role_name
+            );
+            execute format(
+                'alter default privileges revoke all on sequences from %I', role_name
+            );
             execute format(
                 'alter default privileges in schema public revoke all on tables from %I',
                 role_name
@@ -193,6 +212,8 @@ begin
             );
         end if;
     end loop;
+    execute 'alter default privileges revoke all on tables from public';
+    execute 'alter default privileges revoke all on sequences from public';
     execute 'alter default privileges in schema public revoke all on tables from public';
     execute 'alter default privileges in schema public revoke all on sequences from public';
 end
@@ -249,6 +270,7 @@ do $$
 declare
     role_name  text;
     table_name text;
+    privileges text := 'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER';
     ethos_tables text[] := array[
         'environments', 'organizations', 'environment_users', 'teams',
         'team_memberships', 'projects', 'project_memberships', 'tasks',
@@ -256,6 +278,15 @@ declare
         'environment_snapshots'
     ];
 begin
+    -- MAINTAIN was added in PostgreSQL 17 and is rejected as an unknown
+    -- privilege name by older servers, so the list is built at runtime rather
+    -- than hard-coded. On 17+ it must be included: it is the privilege that
+    -- allows VACUUM, ANALYZE, CLUSTER, REINDEX, REFRESH MATERIALIZED VIEW and
+    -- LOCK TABLE, so omitting it would leave a real hole in this check.
+    if current_setting('server_version_num')::int >= 170000 then
+        privileges := privileges || ',MAINTAIN';
+    end if;
+
     foreach role_name in array array['anon', 'authenticated'] loop
         if not exists (select 1 from pg_roles where rolname = role_name) then
             continue;
@@ -264,7 +295,7 @@ begin
             if has_table_privilege(
                 role_name,
                 format('public.%I', table_name),
-                'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER'
+                privileges
             ) then
                 raise exception
                     'role % still holds a privilege on public.%',
@@ -300,29 +331,57 @@ begin
 end
 $$;
 
--- 3. No default privilege in this schema still names anon, authenticated or
---    PUBLIC. This is the check that stops a future table from being exposed.
+-- 3. No default privilege, in this schema or globally, still names anon,
+--    authenticated or PUBLIC. Global entries (defaclnamespace = 0) are the
+--    dangerous ones: they apply to tables created in any schema by their owning
+--    role, and no schema-level REVOKE can subtract them.
 do $$
 declare
-    offending text;
+    offending record;
+    details   text := '';
+    remedy    text := '';
 begin
-    select string_agg(distinct grantee_name, ', ')
-      into offending
-      from (
-            select case
-                       when acl.grantee = 0 then 'PUBLIC'
-                       else pg_get_userbyid(acl.grantee)
-                   end as grantee_name
-              from pg_default_acl defaults
-              cross join lateral aclexplode(defaults.defaclacl) acl
-             where defaults.defaclnamespace = 'public'::regnamespace
-           ) grants
-     where grantee_name in ('PUBLIC', 'anon', 'authenticated');
+    for offending in
+        select owner_role.rolname as owner_name,
+               case
+                   when defaults.defaclnamespace = 0 then 'GLOBAL'
+                   else namespace.nspname
+               end as scope,
+               case
+                   when acl.grantee = 0 then 'PUBLIC'
+                   else pg_get_userbyid(acl.grantee)
+               end as grantee_name,
+               acl.privilege_type
+          from pg_default_acl defaults
+          cross join lateral aclexplode(defaults.defaclacl) acl
+          left join pg_namespace namespace
+                 on namespace.oid = defaults.defaclnamespace
+          left join pg_roles owner_role
+                 on owner_role.oid = defaults.defaclrole
+         where (defaults.defaclnamespace = 0 or namespace.nspname = 'public')
+           and (acl.grantee = 0
+                or pg_get_userbyid(acl.grantee) in ('anon', 'authenticated'))
+    loop
+        details := details || format(
+            E'\n  %s default privileges of role %s grant %s to %s',
+            offending.scope,
+            offending.owner_name,
+            offending.privilege_type,
+            offending.grantee_name
+        );
+        remedy := remedy || format(
+            E'\n  ALTER DEFAULT PRIVILEGES FOR ROLE %I REVOKE ALL ON TABLES FROM %I;',
+            offending.owner_name,
+            offending.grantee_name
+        );
+    end loop;
 
-    if offending is not null then
+    if details <> '' then
         raise exception
-            'default privileges in schema public still grant access to: %',
-            offending;
+            'default privileges can still reach future Ethos tables:%',
+            details
+            || E'\nRun the following as a superuser; a schema-level REVOKE cannot cancel a global default:'
+            || remedy;
     end if;
 end
 $$;
@@ -362,6 +421,18 @@ begin
     end if;
     if has_table_privilege('ethos_app', 'public.environments', 'DELETE') then
         raise exception 'ethos_app must not DELETE environments';
+    end if;
+
+    -- Nothing above grants MAINTAIN, and this keeps it that way. Nested rather
+    -- than combined with AND: PL/pgSQL does not guarantee short-circuit
+    -- evaluation, and on a pre-17 server the bare name would raise.
+    if current_setting('server_version_num')::int >= 170000 then
+        if has_table_privilege('ethos_app', 'public.environment_events', 'MAINTAIN') then
+            raise exception 'ethos_app must not have MAINTAIN on environment_events';
+        end if;
+        if has_table_privilege('ethos_app', 'public.environments', 'MAINTAIN') then
+            raise exception 'ethos_app must not have MAINTAIN on environments';
+        end if;
     end if;
 end
 $$;

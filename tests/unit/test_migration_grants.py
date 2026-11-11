@@ -38,6 +38,11 @@ def test_migration_file_exists():
     assert MIGRATION.stat().st_size > 0
 
 
+def test_dollar_quotes_are_balanced():
+    # A single missing $$ would swallow every later statement into one block.
+    assert SQL.count("$$") % 2 == 0
+
+
 @pytest.mark.parametrize("table", TABLES)
 def test_every_table_is_named(table):
     assert f"'{table}'" in SQL
@@ -65,7 +70,7 @@ def test_membership_inheritance_is_checked():
 def test_default_acl_is_checked():
     assert "pg_default_acl" in SQL
     assert "aclexplode" in LOWER
-    assert "still grant access to" in LOWER
+    assert "can still reach future ethos tables" in LOWER
 
 
 def test_privileges_are_asserted_absent():
@@ -102,3 +107,37 @@ def test_rls_policies_are_preserved():
 def test_ethos_app_positive_control_is_asserted():
     assert "ethos_app lost select" in LOWER
     assert "ethos_app lost insert" in LOWER
+
+
+def test_global_default_privileges_are_revoked():
+    # Without FOR ROLE / IN SCHEMA this is the global default scope, the only
+    # one a schema-level REVOKE cannot reach.
+    assert "alter default privileges revoke all on tables" in LOWER
+    assert "alter default privileges revoke all on sequences" in LOWER
+
+
+def test_schema_scoped_defaults_are_still_revoked():
+    assert "alter default privileges in schema public revoke all on tables" in LOWER
+
+
+def test_default_privilege_validation_covers_global_scope():
+    assert "defaults.defaclnamespace = 0 or namespace.nspname = 'public'" in SQL
+
+
+def test_global_default_failure_names_owner_and_remedy():
+    assert "defaclrole" in SQL
+    assert "alter default privileges for role %i" in LOWER
+    assert "cannot cancel a global default" in LOWER
+
+
+def test_maintain_is_version_gated():
+    # MAINTAIN is unknown before PostgreSQL 17, so naming it unconditionally
+    # would make the migration fail on older servers.
+    assert "server_version_num" in LOWER
+    assert "170000" in SQL
+    assert "privileges := privileges || ',MAINTAIN'" in SQL
+
+
+def test_maintain_check_covers_or_omits_nothing():
+    assert "'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER'" in SQL
+    assert "ethos_app must not have maintain" in LOWER
